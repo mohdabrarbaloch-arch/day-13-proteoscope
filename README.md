@@ -14,26 +14,25 @@ traceable to a published scale.
 
 ## What it does
 
-Proteoscope is a protein structure analysis tool that runs entirely in your
-browser and on a small FastAPI backend. Paste a protein sequence and get back:
+Give it a protein sequence. It gives you back:
 
-- **Physicochemical properties** — molecular weight, isoelectric point, charge
-  at pH 7, GRAVY hydrophobicity, and amino-acid composition.
-- **Secondary structure** — a Chou-Fasman prediction with per-residue
-  assignments and helix/sheet/turn/coil fractions.
-- **A residue-residue contact map** — predicted contacts with a confidence
-  score for each one.
-- **A 3D C-alpha trace** — a rotatable backbone model built by a
-  position-based-dynamics relaxation, coloured by secondary structure.
-- **A per-residue confidence profile** and a full residue table.
-- **Exports** — PDB, CSV, and a plain-text report.
+- **Physicochemical properties** — molecular weight, isoelectric point (by
+  bisection), GRAVY, aliphatic index, aromaticity, extinction coefficient.
+- **Secondary structure** — H/E/T/C per residue, via Chou-Fasman propensities,
+  with the contiguous segments listed.
+- **A contact map** — which residues are close in space, constrained by what the
+  chain can physically reach.
+- **A 3D C-alpha trace** — ideal geometry, then position-based dynamics to
+  satisfy the contacts and remove clashes. Rotatable in the browser.
+- **Per-residue confidence** — a heuristic in [0, 1], labelled as a heuristic.
 
 ## What this is not
 
-This is not AlphaFold, and it does not pretend to be. There are **no learned
-weights, no GPU, and no network calls**. Every number comes from a published
-scale (Chou-Fasman propensities, Kyte-Doolittle hydrophobicity, standard residue
-masses) or a stated heuristic. The same input always gives the same output.
+**It is not AlphaFold.** There are no learned weights and no network calls. The
+secondary-structure method is Chou-Fasman (1974), which agrees with experiment
+on roughly 60–65% of residues. The 3D trace is a physically-constrained model,
+not a prediction of the true fold. Use it for teaching, triage, and exploration
+— not for anything that depends on a real structure.
 
 That trade is the whole point. A tool where you can point at any residue and say
 *why* it was called a helix is useful in a way an opaque model is not.
@@ -60,49 +59,55 @@ cd day-13-proteoscope
 
 python3 -m venv .venv && source .venv/bin/activate
 pip install -r requirements.txt
-cp .env.example .env
+
+cp .env.example .env          # defaults work as-is for local dev
 uvicorn app.main:app --reload --port 8013
 ```
 
-Open http://localhost:8013 — no account needed to run a prediction. Sign in only
-if you want to save predictions and export them later.
+Open <http://localhost:8013>. Interactive API docs are at
+<http://localhost:8013/api/docs>.
 
 ### With Docker
 
 ```bash
 docker compose up --build
-# app on http://localhost:8013, Postgres on 5433
 ```
+
+That brings up the app on port 8013 and a PostgreSQL instance behind it.
 
 ## Usage
 
 ### In the browser
 
-1. Paste a sequence (plain text or FASTA) into the box.
-2. Optionally give it a label and tick **Save** to keep it on your account.
-3. Click **Analyze**. The result appears in three views: Structure, Contacts,
-   and Properties.
-4. Drag to rotate the 3D trace. Export as PDB, CSV, or text from the result
-   panel.
+1. Paste a sequence (bare, or a FASTA record — headers are handled).
+2. Optionally give it a label and tick **Save to my account**.
+3. Hit **Analyze structure**.
+
+The example chips load a real sequence (chicken lysozyme C) and two synthetic
+peptides so you can see the difference between a helix-rich and a sheet-rich
+result immediately.
 
 ### From the API
 
 ```bash
 # Register (returns a token immediately — no second login round-trip)
-curl -X POST http://localhost:8013/api/auth/register \
+TOKEN=$(curl -s -X POST http://localhost:8013/api/auth/register \
   -H 'Content-Type: application/json' \
-  -d '{"email":"you@example.com","password":"hunter2hunter2","full_name":"You"}'
+  -d '{"email":"you@example.com","password":"helix1234","full_name":"You"}' \
+  | python3 -c 'import sys,json; print(json.load(sys.stdin)["access_token"])')
 
 # Predict and save
-curl -X POST http://localhost:8013/api/predictions \
+curl -s -X POST http://localhost:8013/api/predictions \
+  -H "Authorization: Bearer $TOKEN" \
   -H 'Content-Type: application/json' \
-  -H 'Authorization: Bearer <token>' \
-  -d '{"sequence":"MKTAYIAKQRQISFVKSHFSRQLEERLGLIEVQAPILSRVGDGTQDNLSGAEKAVQVKVKALPDAQFEVVHSLAKWKR","save":true,"label":"Lysozyme"}'
+  -d '{"sequence":"MKTAYIAKQRQISFVKSHFSRQLEERLGLIEVQAPILSRVGDGTQDNLSGAEKAVQVKVKALPDAQFEVVHSLAKWKR","save":true,"label":"Lysozyme C"}'
 
 # Export as PDB
-curl http://localhost:8013/api/predictions/1/export?fmt=pdb \
-  -H 'Authorization: Bearer <token>'
+curl -s "http://localhost:8013/api/predictions/1/export?fmt=pdb" \
+  -H "Authorization: Bearer $TOKEN" -o structure.pdb
 ```
+
+Full endpoint reference: [`docs/api.md`](docs/api.md).
 
 ## Tests
 
@@ -163,15 +168,31 @@ single command once a token is present.
 
 ```
 app/
-  engine/        # the structure pipeline (sequence, secondary, geometry, predict)
-  routers/       # FastAPI routers (auth, predictions, health)
-  static/        # the SPA (index.html, styles.css, app.js)
-  main.py        # app assembly, middleware, error handling
-api/index.py     # Vercel serverless entrypoint
-scripts/         # screenshot capture + push helpers
-tests/           # pytest suite
+  engine/          pure computation, no I/O
+    sequence.py    parsing, validation, physicochemical properties
+    secondary.py   Chou-Fasman secondary-structure prediction
+    geometry.py    contact map + 3D trace (position-based dynamics)
+    predict.py     pipeline orchestration
+    report.py      text / PDB / CSV export
+  routers/         health, auth, predictions
+  static/          the SPA (index.html, styles.css, app.js)
+  config.py        env-driven settings + production safety checks
+  database.py      engine, session factory, declarative base
+  models.py        User, Prediction
+  schemas.py       request/response validation
+  security.py      bcrypt + JWT
+  ratelimit.py     sliding-window limiter
+  deps.py          current-user and db dependencies
+  main.py          app factory, middleware, error handlers
+api/index.py       Vercel serverless entrypoint
+tests/             78 tests
+docs/              setup, usage, API reference
 ```
 
 ## License
 
 MIT — see [LICENSE](LICENSE).
+
+---
+
+*Part of a 30-day build challenge: one production-shaped project a day.*
