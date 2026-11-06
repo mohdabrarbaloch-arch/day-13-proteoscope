@@ -2,103 +2,185 @@
 
 from __future__ import annotations
 
-import time
-from contextlib import asynccontextmanager
-from pathlib import Path
+import logging
+import os
+import uuid
 
-from fastapi import FastAPI, Request
+from fastapi import FastAPI, Request, status
+from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
+from starlette.exceptions import HTTPException as StarletteHTTPException
 
 from app.config import settings
 from app.database import init_db
+from app.engine.predict import ENGINE_NAME, ENGINE_VERSION
+from app.engine.report import DISCLAIMER
 from app.ratelimit import Limit, RateLimiter
 from app.routers import auth, health, predictions
 
-_STATIC_DIR = Path(__file__).parent / "static"
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s %(message)s")
+logger = logging.getLogger("proteoscope")
 
+STATIC_DIR = os.path.join(os.path.dirname(__file__), "static")
 
-@asynccontextmanager
-async def lifespan(_: FastAPI):
-    init_db()
-    yield
-
-
-app = FastAPI(
-    title="Proteoscope API",
-    description="Deterministic, explainable protein structure analysis.",
-    version="1.0.0",
-    lifespan=lifespan,
-    docs_url="/api/docs",
-    redoc_url="/api/redoc",
-    openapi_url="/api/openapi.json",
+# Path-prefix -> limit. Longest matching prefix wins.
+RATE_LIMITS: tuple[tuple[str, str], ...] = (
+    ("/api/auth", settings.rate_limit_auth),
+    ("/api/predictions", settings.rate_limit_predict),
+    ("/api", settings.rate_limit_default),
 )
 
-# --- CORS ---
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=settings.cors_origins,
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
-
-# --- Rate limiting (in-process sliding window) ---
-_limiter = RateLimiter()
-_limits = {
-    "/api/auth": Limit.parse(settings.rate_limit_auth),
-    "/api/predictions": Limit.parse(settings.rate_limit_predict),
+SECURITY_HEADERS = {
+    "X-Content-Type-Options": "nosniff",
+    "X-Frame-Options": "DENY",
+    "Referrer-Policy": "no-referrer",
+    "Permissions-Policy": "geolocation=(), microphone=(), camera=()",
+    "Cross-Origin-Opener-Policy": "same-origin",
 }
 
 
-@app.middleware("http")
-async def rate_limit_middleware(request: Request, call_next):
-    """Apply a per-IP sliding-window limit to API routes."""
-    path = request.url.path
-    if path.startswith("/api"):
-        limit = next((v for k, v in _limits.items() if path.startswith(k)), Limit.parse(settings.rate_limit_default))
-        client_ip = request.client.host if request.client else "unknown"
-        allowed, retry_after = _limiter.check(client_ip, limit)
-        if not allowed:
-            return JSONResponse(
-                status_code=429,
-                content={"detail": "Too many requests. Please slow down."},
-                headers={"Retry-After": str(int(retry_after))},
-            )
-    return await call_next(request)
+def _limit_for(path: str) -> Limit | None:
+    best: tuple[int, str] | None = None
+    for prefix, spec in RATE_LIMITS:
+        if path.startswith(prefix) and (best is None or len(prefix) > best[0]):
+            best = (len(prefix), spec)
+    return Limit.parse(best[1]) if best else None
 
 
-# --- Routers ---
-app.include_router(health.router)
-app.include_router(auth.router)
-app.include_router(predictions.router)
+def create_app() -> FastAPI:
+    problems = settings.validate()
+    if problems:
+        raise RuntimeError("Invalid configuration: " + "; ".join(problems))
+
+    app = FastAPI(
+        title=f"{settings.app_name} API",
+        description=(
+            "Deterministic, explainable protein structure analysis. "
+            "Not AlphaFold — no learned weights, no network calls."
+        ),
+        version="1.0.0",
+        docs_url="/api/docs",
+        openapi_url="/api/openapi.json",
+        redoc_url=None,
+    )
+
+    app.state.limiter = RateLimiter()
+
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origins=settings.cors_origins,
+        allow_credentials=True,
+        allow_methods=["GET", "POST", "DELETE", "OPTIONS"],
+        allow_headers=["Authorization", "Content-Type"],
+        max_age=600,
+    )
+
+    @app.middleware("http")
+    async def security_and_limits(request: Request, call_next):
+        request_id = uuid.uuid4().hex[:12]
+        request.state.request_id = request_id
+
+        limit = _limit_for(request.url.path)
+        if limit is not None:
+            client = request.client.host if request.client else "unknown"
+            allowed, retry_after = app.state.limiter.check(f"{client}:{request.url.path}", limit)
+            if not allowed:
+                response = JSONResponse(
+                    status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+                    content={
+                        "error": "rate_limited",
+                        "detail": "Too many requests. Please slow down.",
+                        "request_id": request_id,
+                    },
+                )
+                response.headers["Retry-After"] = str(int(retry_after) + 1)
+                for k, v in SECURITY_HEADERS.items():
+                    response.headers[k] = v
+                return response
+
+        response = await call_next(request)
+        for k, v in SECURITY_HEADERS.items():
+            response.headers[k] = v
+        response.headers["X-Request-ID"] = request_id
+        return response
+
+    @app.exception_handler(StarletteHTTPException)
+    async def http_exc_handler(request: Request, exc: StarletteHTTPException):
+        return JSONResponse(
+            status_code=exc.status_code,
+            content={
+                "error": "http_error",
+                "detail": str(exc.detail),
+                "request_id": getattr(request.state, "request_id", ""),
+            },
+        )
+
+    @app.exception_handler(RequestValidationError)
+    async def validation_exc_handler(request: Request, exc: RequestValidationError):
+        return JSONResponse(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            content={
+                "error": "validation_error",
+                "detail": "Request validation failed",
+                "request_id": getattr(request.state, "request_id", ""),
+                "fields": [{"loc": list(e.get("loc", [])), "msg": e.get("msg", "")} for e in exc.errors()],
+            },
+        )
+
+    @app.exception_handler(Exception)
+    async def unhandled_exc_handler(request: Request, exc: Exception):  # noqa: ARG001
+        logger.exception("unhandled error on %s", request.url.path)
+        return JSONResponse(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            content={
+                "error": "internal_error",
+                "detail": "An unexpected error occurred.",
+                "request_id": getattr(request.state, "request_id", ""),
+            },
+        )
+
+    app.include_router(health.router)
+    app.include_router(auth.router)
+    app.include_router(predictions.router)
+
+    # Create tables eagerly rather than only in the startup hook. The ASGI
+    # lifespan event does not fire under every runner — notably a bare
+    # TestClient and Vercel's serverless runtime — and a missing table shows up
+    # as a 500 on the first request, which is a miserable thing to debug.
+    # create_all() is idempotent, so calling it here and on startup is safe.
+    init_db()
+
+    @app.on_event("startup")
+    def _startup() -> None:
+        init_db()
+        logger.info(
+            "%s started | env=%s | engine=%s v%s",
+            settings.app_name,
+            settings.environment,
+            ENGINE_NAME,
+            ENGINE_VERSION,
+        )
+
+    @app.get("/api", include_in_schema=False)
+    def api_root() -> dict:
+        return {
+            "app": settings.app_name,
+            "engine": ENGINE_NAME,
+            "version": ENGINE_VERSION,
+            "docs": "/api/docs",
+            "disclaimer": DISCLAIMER,
+        }
+
+    if os.path.isdir(STATIC_DIR):
+        app.mount("/assets", StaticFiles(directory=STATIC_DIR), name="assets")
+
+        @app.get("/", include_in_schema=False)
+        def index() -> FileResponse:
+            return FileResponse(os.path.join(STATIC_DIR, "index.html"))
+
+    return app
 
 
-# --- Static SPA ---
-@app.get("/", include_in_schema=False)
-def index() -> FileResponse:
-    return FileResponse(_STATIC_DIR / "index.html")
-
-
-app.mount("/static", StaticFiles(directory=_STATIC_DIR), name="static")
-
-
-# --- Error handling ---
-@app.exception_handler(Exception)
-async def unhandled_exception_handler(_: Request, exc: Exception) -> JSONResponse:
-    """Last-resort handler so a crash returns JSON, not an HTML stack trace."""
-    if settings.debug:
-        return JSONResponse(status_code=500, content={"detail": f"Internal error: {exc}"})
-    return JSONResponse(status_code=500, content={"detail": "Internal server error."})
-
-
-@app.middleware("http")
-async def add_security_headers(request: Request, call_next):
-    """A minimal set of security headers (helmet-style, no extra dependency)."""
-    response = await call_next(request)
-    response.headers["X-Content-Type-Options"] = "nosniff"
-    response.headers["X-Frame-Options"] = "DENY"
-    response.headers["Referrer-Policy"] = "no-referrer"
-    response.headers["X-XSS-Protection"] = "1; mode=block"
-    return response
+app = create_app()
