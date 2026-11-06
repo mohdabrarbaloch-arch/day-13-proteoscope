@@ -1,196 +1,338 @@
 """Sequence parsing, validation, and physicochemical properties.
 
-Every constant here is a published value: standard residue masses, Kyte-Doolittle
-hydrophobicity, and the pKa table used for the isoelectric point. Nothing is
-fitted or learned.
+Every constant here is a published value, not a fitted one:
+
+* residue masses      -- average isotopic masses (IUPAC)
+* Kyte-Doolittle      -- hydropathy scale, J. Mol. Biol. 157:105 (1982)
+* pKa set             -- EMBOSS/ExPASy convention
+* extinction coeff.   -- Gill & von Hippel, Anal. Biochem. 182:319 (1989)
+* aliphatic index     -- Ikai, J. Biochem. 88:1895 (1980)
+
+Nothing in this module is random or time-dependent, so the same sequence always
+yields the same numbers.
 """
 
 from __future__ import annotations
 
-import re
 from dataclasses import dataclass
 
-from app.config import settings
+STANDARD_AA: str = "ACDEFGHIKLMNPQRSTVWY"
+AA_SET: frozenset[str] = frozenset(STANDARD_AA)
 
-# ---------------------------------------------------------------------------
-# Residue data
-# ---------------------------------------------------------------------------
+THREE_LETTER: dict[str, str] = {
+    "A": "Ala",
+    "R": "Arg",
+    "N": "Asn",
+    "D": "Asp",
+    "C": "Cys",
+    "E": "Glu",
+    "Q": "Gln",
+    "G": "Gly",
+    "H": "His",
+    "I": "Ile",
+    "L": "Leu",
+    "K": "Lys",
+    "M": "Met",
+    "F": "Phe",
+    "P": "Pro",
+    "S": "Ser",
+    "T": "Thr",
+    "W": "Trp",
+    "Y": "Tyr",
+    "V": "Val",
+}
 
-# Monoisotopic residue masses (Da) — the mass of the amino acid minus water.
+# Average residue masses in daltons (residue only, no water).
 RESIDUE_MASS: dict[str, float] = {
-    "A": 71.03711, "R": 156.10111, "N": 114.04293, "D": 115.02694, "C": 103.00919,
-    "E": 129.04259, "Q": 128.05858, "G": 57.02146, "H": 137.05891, "I": 113.08406,
-    "L": 113.08406, "K": 128.09496, "M": 131.04049, "F": 147.06841, "P": 97.05276,
-    "S": 87.03203, "T": 101.04768, "W": 186.07931, "Y": 163.06333, "V": 99.06841,
+    "A": 71.0788,
+    "R": 156.1875,
+    "N": 114.1038,
+    "D": 115.0886,
+    "C": 103.1388,
+    "E": 129.1155,
+    "Q": 128.1307,
+    "G": 57.0519,
+    "H": 137.1411,
+    "I": 113.1594,
+    "L": 113.1594,
+    "K": 128.1741,
+    "M": 131.1926,
+    "F": 147.1766,
+    "P": 97.1167,
+    "S": 87.0782,
+    "T": 101.1051,
+    "W": 186.2132,
+    "Y": 163.1760,
+    "V": 99.1326,
 }
 
-# Kyte-Doolittle hydropathy index (Kyte & Doolittle 1982).
-HYDROPATHY: dict[str, float] = {
-    "I": 4.5, "V": 4.2, "L": 3.8, "F": 2.8, "C": 2.5, "M": 1.9, "A": 1.8,
-    "G": -0.4, "T": -0.7, "S": -0.8, "W": -0.9, "Y": -1.3, "P": -1.6, "H": -3.2,
-    "D": -3.5, "E": -3.5, "Q": -3.5, "N": -3.5, "K": -3.9, "R": -4.5,
+WATER_MASS: float = 18.0153
+
+# Kyte-Doolittle hydropathy. Positive = hydrophobic, negative = hydrophilic.
+KYTE_DOOLITTLE: dict[str, float] = {
+    "A": 1.8,
+    "R": -4.5,
+    "N": -3.5,
+    "D": -3.5,
+    "C": 2.5,
+    "Q": -3.5,
+    "E": -3.5,
+    "G": -0.4,
+    "H": -3.2,
+    "I": 4.5,
+    "L": 3.8,
+    "K": -3.9,
+    "M": 1.9,
+    "F": 2.8,
+    "P": -1.6,
+    "S": -0.8,
+    "T": -0.7,
+    "W": -0.9,
+    "Y": -1.3,
+    "V": 4.2,
 }
 
-# pKa values used for the isoelectric point (Bjellqvist-style, simplified).
-# (side-chain pKa, N-terminus pKa, C-terminus pKa)
-_PKA_SIDECHAIN = {"D": 3.9, "E": 4.3, "C": 8.3, "Y": 10.1, "H": 6.0, "K": 10.5, "R": 12.4}
-_PKA_NTERM = 8.0
-_PKA_CTERM = 3.1
+# Side-chain pKa values (EMBOSS convention) plus the terminal groups.
+PKA_SIDECHAIN: dict[str, float] = {
+    "C": 8.5,
+    "D": 3.9,
+    "E": 4.1,
+    "H": 6.5,
+    "K": 10.8,
+    "R": 12.5,
+    "Y": 10.1,
+}
+PKA_NTERM: float = 8.6
+PKA_CTERM: float = 3.6
 
-# ---------------------------------------------------------------------------
-# Parsing
-# ---------------------------------------------------------------------------
+# Residues that carry a positive charge when protonated.
+POSITIVE: frozenset[str] = frozenset("KRH")
+NEGATIVE: frozenset[str] = frozenset("DECY")
 
-_FASTA_HEADER = re.compile(r"^>(.*)$", re.MULTILINE)
-_VALID = set(RESIDUE_MASS) | {"B", "Z", "X"}
+AROMATIC: frozenset[str] = frozenset("FWY")
 
 
 class SequenceError(ValueError):
-    """Raised when a sequence cannot be analysed."""
+    """Raised when a sequence cannot be parsed or is not usable."""
 
 
 @dataclass(frozen=True)
 class ParsedSequence:
-    """A validated, cleaned sequence plus its FASTA header (if any)."""
+    """A validated protein sequence plus the raw input it came from."""
 
-    cleaned: str
-    header: str
-    length: int
+    sequence: str
+    raw_length: int
+    header: str | None
+    removed: int
+
+    @property
+    def length(self) -> int:
+        return len(self.sequence)
 
 
 def parse_sequence(raw: str) -> ParsedSequence:
-    """Validate and normalise a raw sequence (plain text or FASTA).
+    """Clean and validate a protein sequence.
 
-    Raises SequenceError on any problem. Whitespace and digits are stripped;
-    a FASTA header line is captured but not treated as sequence.
+    Accepts a bare sequence or a FASTA record (``>header`` line first). Strips
+    whitespace, digits and common separators, uppercases the rest, and rejects
+    anything that is not one of the 20 standard residues.
+
+    Raises:
+        SequenceError: if the input is empty, too short, or contains residues
+            outside the standard alphabet.
     """
-    if not raw or not raw.strip():
-        raise SequenceError("Sequence is empty.")
+    if raw is None:
+        raise SequenceError("No sequence provided.")
 
-    text = raw.strip()
-    header = ""
-    if text.startswith(">"):
-        lines = text.splitlines()
-        header = lines[0][1:].strip()
-        body = "".join(lines[1:])
-    else:
-        body = "".join(text.split())
+    header: str | None = None
+    body_lines: list[str] = []
+    for line in raw.splitlines():
+        stripped = line.strip()
+        if not stripped:
+            continue
+        if stripped.startswith(">") or stripped.startswith(";"):
+            if header is None:
+                header = stripped[1:].strip() or None
+            continue
+        body_lines.append(stripped)
 
-    # Remove any digits that slipped in (some FASTA files number lines).
-    body = re.sub(r"[0-9]", "", body)
-    body = body.upper()
+    joined = "".join(body_lines)
+    # Drop whitespace, digits and the separators people paste in from papers.
+    cleaned_chars: list[str] = []
+    for ch in joined:
+        if ch.isspace() or ch.isdigit() or ch in "-.*_|,":
+            continue
+        cleaned_chars.append(ch.upper())
 
-    if len(body) < settings.min_sequence_length:
-        raise SequenceError(
-            f"Sequence is too short: {len(body)} residues. "
-            f"Minimum is {settings.min_sequence_length}."
-        )
-    if len(body) > settings.max_sequence_length:
-        raise SequenceError(
-            f"Sequence is too long: {len(body)} residues. "
-            f"Maximum is {settings.max_sequence_length}."
-        )
+    sequence = "".join(cleaned_chars)
+    removed = len(joined) - len(sequence)
 
-    invalid = sorted({c for c in body if c not in _VALID})
+    if not sequence:
+        raise SequenceError("No sequence provided.")
+
+    invalid = sorted({c for c in sequence if c not in AA_SET})
     if invalid:
-        raise SequenceError(f"Sequence contains invalid amino-acid letters: {''.join(invalid)}")
+        shown = ", ".join(invalid[:10])
+        raise SequenceError(
+            f"Sequence contains {len(invalid)} non-standard residue type(s): {shown}. "
+            "Only the 20 standard amino acids (ACDEFGHIKLMNPQRSTVWY) are supported."
+        )
 
-    return ParsedSequence(cleaned=body, header=header, length=len(body))
+    if len(sequence) < 10:
+        raise SequenceError(
+            f"Sequence is only {len(sequence)} residues long. "
+            "At least 10 are needed for a meaningful prediction."
+        )
+
+    return ParsedSequence(
+        sequence=sequence,
+        raw_length=len(joined),
+        header=header,
+        removed=removed,
+    )
 
 
-# ---------------------------------------------------------------------------
-# Physicochemical properties
-# ---------------------------------------------------------------------------
+def composition(sequence: str) -> dict[str, int]:
+    """Count each standard residue. Absent residues are reported as 0."""
+    counts = dict.fromkeys(STANDARD_AA, 0)
+    for ch in sequence:
+        counts[ch] += 1
+    return counts
+
 
 def molecular_weight(sequence: str) -> float:
-    """Molecular weight in Da, using monoisotopic residue masses.
-
-    The weight of a protein is the sum of its residue masses plus the mass of
-    one water molecule (the peptide bond condensation).
-    """
-    total = sum(RESIDUE_MASS.get(aa, 0.0) for aa in sequence)
-    return total + 18.01528
-
-
-def isoelectric_point(sequence: str) -> float:
-    """Isoelectric point by a simplified Henderson-Hasselbalch charge model.
-
-    The pI is the pH at which the net charge is zero. We bisect over pH 0-14.
-    """
-    n = len(sequence)
-    if n == 0:
-        return 7.0
-
-    def net_charge(ph: float) -> float:
-        charge = 0.0
-        # N-terminus (positive below its pKa).
-        charge += 1.0 / (1.0 + 10 ** (_PKA_NTERM - ph))
-        # C-terminus (negative above its pKa).
-        charge -= 1.0 / (1.0 + 10 ** (ph - _PKA_CTERM))
-        for aa in sequence:
-            pka = _PKA_SIDECHAIN.get(aa)
-            if pka is None:
-                continue
-            if aa in {"D", "E", "C", "Y"}:
-                charge -= 1.0 / (1.0 + 10 ** (ph - pka))
-            else:  # H, K, R — basic
-                charge += 1.0 / (1.0 + 10 ** (pka - ph))
-        return charge
-
-    lo, hi = 0.0, 14.0
-    for _ in range(60):
-        mid = (lo + hi) / 2.0
-        if net_charge(mid) > 0:
-            lo = mid
-        else:
-            hi = mid
-    return round((lo + hi) / 2.0, 2)
-
-
-def charge_at_ph7(sequence: str) -> float:
-    """Net charge at pH 7.0."""
-    n = len(sequence)
-    if n == 0:
+    """Average molecular weight in daltons, including the water lost on bonding."""
+    if not sequence:
         return 0.0
+    return sum(RESIDUE_MASS[c] for c in sequence) + WATER_MASS
+
+
+def net_charge(sequence: str, ph: float) -> float:
+    """Net charge at a given pH, using the Henderson-Hasselbalch approximation.
+
+    Termini are counted once each; every ionisable side chain is counted per
+    occurrence.
+    """
+    if not sequence:
+        return 0.0
+
     charge = 0.0
-    charge += 1.0 / (1.0 + 10 ** (_PKA_NTERM - 7.0))
-    charge -= 1.0 / (1.0 + 10 ** (7.0 - _PKA_CTERM))
-    for aa in sequence:
-        pka = _PKA_SIDECHAIN.get(aa)
-        if pka is None:
+    # N-terminus (positive when protonated).
+    charge += 1.0 / (1.0 + 10.0 ** (ph - PKA_NTERM))
+    # C-terminus (negative when deprotonated).
+    charge -= 1.0 / (1.0 + 10.0 ** (PKA_CTERM - ph))
+
+    for residue, pka in PKA_SIDECHAIN.items():
+        count = sequence.count(residue)
+        if not count:
             continue
-        if aa in {"D", "E", "C", "Y"}:
-            charge -= 1.0 / (1.0 + 10 ** (7.0 - pka))
+        if residue in POSITIVE:
+            charge += count / (1.0 + 10.0 ** (ph - pka))
         else:
-            charge += 1.0 / (1.0 + 10 ** (pka - 7.0))
-    return round(charge, 2)
+            charge -= count / (1.0 + 10.0 ** (pka - ph))
+    return charge
+
+
+def isoelectric_point(sequence: str, tolerance: float = 1e-4) -> float:
+    """The pH at which net charge is zero, found by bisection.
+
+    Bisection rather than a closed form because the charge function is monotonic
+    in pH but not analytically invertible once several groups overlap.
+    """
+    if not sequence:
+        return 0.0
+    low, high = 0.0, 14.0
+    for _ in range(100):
+        mid = (low + high) / 2.0
+        if net_charge(sequence, mid) > 0:
+            low = mid
+        else:
+            high = mid
+        if high - low < tolerance:
+            break
+    return round((low + high) / 2.0, 2)
 
 
 def gravy(sequence: str) -> float:
     """Grand average of hydropathy (Kyte-Doolittle)."""
     if not sequence:
         return 0.0
-    return round(sum(HYDROPATHY.get(aa, 0.0) for aa in sequence) / len(sequence), 2)
+    return round(sum(KYTE_DOOLITTLE[c] for c in sequence) / len(sequence), 3)
 
 
-def composition(sequence: str) -> dict[str, float]:
-    """Amino-acid composition as percentages of the sequence."""
+def aromaticity(sequence: str) -> float:
+    """Fraction of aromatic residues (F, W, Y)."""
+    if not sequence:
+        return 0.0
+    return round(sum(1 for c in sequence if c in AROMATIC) / len(sequence), 4)
+
+
+def aliphatic_index(sequence: str) -> float:
+    """Ikai's aliphatic index: 100 * (A% + 2.9*V% + 3.9*(I% + L%)).
+
+    A rough proxy for thermostability — higher means a more tightly packed
+    aliphatic core.
+    """
+    if not sequence:
+        return 0.0
+    n = len(sequence)
+    a = sequence.count("A") / n * 100.0
+    v = sequence.count("V") / n * 100.0
+    i = sequence.count("I") / n * 100.0
+    leu = sequence.count("L") / n * 100.0
+    return round(a + 2.9 * v + 3.9 * (i + leu), 2)
+
+
+def extinction_coefficient(sequence: str) -> int:
+    """Molar extinction coefficient at 280 nm (Gill & von Hippel).
+
+    Assumes all cysteines are reduced, which is the conservative choice: it
+    under-reports rather than over-reports.
+    """
+    n_w = sequence.count("W")
+    n_y = sequence.count("Y")
+    return n_w * 5500 + n_y * 1490
+
+
+def absorbance_280(sequence: str) -> float:
+    """A280 of a 1 g/L solution, i.e. epsilon / molecular weight."""
+    mw = molecular_weight(sequence)
+    if mw <= 0:
+        return 0.0
+    return round(extinction_coefficient(sequence) / mw, 3)
+
+
+def hydropathy_profile(sequence: str, window: int = 9) -> list[float]:
+    """Sliding-window Kyte-Doolittle average, one value per residue.
+
+    Windows are truncated at the termini rather than padded, so the first and
+    last values are averages over fewer residues — the alternative (padding with
+    zeros) invents data that is not there.
+    """
     n = len(sequence)
     if n == 0:
-        return {}
-    counts: dict[str, int] = {}
-    for aa in sequence:
-        counts[aa] = counts.get(aa, 0) + 1
-    return {aa: round(count / n * 100.0, 2) for aa, count in sorted(counts.items())}
+        return []
+    window = max(1, min(window, n))
+    half = window // 2
+    profile: list[float] = []
+    for i in range(n):
+        lo = max(0, i - half)
+        hi = min(n, i + half + 1)
+        segment = sequence[lo:hi]
+        profile.append(round(sum(KYTE_DOOLITTLE[c] for c in segment) / len(segment), 3))
+    return profile
 
 
 def properties(sequence: str) -> dict:
-    """All physicochemical properties in one dict, ready for the API."""
+    """The full physicochemical summary for a sequence."""
     return {
         "length": len(sequence),
         "molecular_weight_da": round(molecular_weight(sequence), 2),
         "isoelectric_point": isoelectric_point(sequence),
-        "charge_at_ph7": charge_at_ph7(sequence),
+        "net_charge_ph7": round(net_charge(sequence, 7.0), 3),
         "gravy": gravy(sequence),
-        "composition": composition(sequence),
+        "aromaticity": aromaticity(sequence),
+        "aliphatic_index": aliphatic_index(sequence),
+        "extinction_coefficient_m1cm1": extinction_coefficient(sequence),
+        "absorbance_280_1g_per_l": absorbance_280(sequence),
     }
