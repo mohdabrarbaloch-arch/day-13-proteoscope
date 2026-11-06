@@ -1,0 +1,35 @@
+services:
+  db:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: proteoscope
+      POSTGRES_PASSWORD: proteoscope
+      POSTGRES_DB: proteoscope
+    ports:
+      - "5433:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U proteoscope"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  app:
+    build: .
+    restart: unless-stopped
+    depends_on:
+      db:
+        condition: service_healthy
+    environment:
+      ENVIRONMENT: production
+      DEBUG: "false"
+      SECRET_KEY: ${SECRET_KEY:-change-me-in-production-please-32chars}
+      DATABASE_URL: postgresql+psycopg2://proteoscope:proteoscope@db:5432/proteoscope
+      CORS_ORIGINS: http://localhost:8013,http://127.0.0.1:8013
+    ports:
+      - "8013:8013"
+
+volumes:
+  pgdata:
