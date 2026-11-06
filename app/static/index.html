@@ -1,0 +1,225 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Proteoscope — Protein Structure Analysis</title>
+  <meta name="description" content="Deterministic, explainable protein structure analysis. Sequence in, secondary structure, contact map and a 3D C-alpha trace out." />
+  <link rel="stylesheet" href="/assets/styles.css" />
+</head>
+<body>
+  <header class="topbar">
+    <div class="brand">
+      <span class="logo" aria-hidden="true">
+        <svg viewBox="0 0 32 32" width="26" height="26" fill="none" stroke="currentColor" stroke-width="2.1" stroke-linecap="round">
+          <path d="M6 24c4-2 6-6 6-10S10 6 6 6" />
+          <path d="M26 8c-4 2-6 6-6 10s2 8 6 8" />
+          <path d="M9 12h14M9 20h14" opacity=".55" />
+        </svg>
+      </span>
+      <div>
+        <h1>Proteoscope</h1>
+        <p class="tagline">Explainable protein structure analysis</p>
+      </div>
+    </div>
+    <nav class="topnav">
+      <button id="nav-analyze" class="navbtn active" type="button">Analyze</button>
+      <button id="nav-saved" class="navbtn" type="button">Saved</button>
+      <button id="nav-about" class="navbtn" type="button">About</button>
+      <span id="auth-slot" class="auth-slot"></span>
+    </nav>
+  </header>
+
+  <main>
+    <!-- ================= ANALYZE ================= -->
+    <section id="view-analyze" class="view active">
+      <div class="panel input-panel">
+        <div class="panel-head">
+          <h2>Sequence input</h2>
+          <span class="hint">Bare sequence or FASTA. 10–2000 residues.</span>
+        </div>
+
+        <label class="field">
+          <span class="field-label">Protein sequence</span>
+          <textarea id="sequence" rows="7" spellcheck="false"
+            placeholder=">sp|P00698|LYSC_CHICK Lysozyme C&#10;MKTAYIAKQRQISFVKSHFSRQLEERLGLIEVQAPILSRVGDGTQDNLSGAEKAVQVKVKALPDAQFEVVHSLAKWKR"></textarea>
+        </label>
+
+        <div class="row">
+          <label class="field grow">
+            <span class="field-label">Label <em>(optional)</em></span>
+            <input id="label" type="text" maxlength="160" placeholder="e.g. Lysozyme C, test run 3" />
+          </label>
+          <label class="field">
+            <span class="field-label">Window</span>
+            <select id="window">
+              <option value="9">9 (default)</option>
+              <option value="7">7</option>
+              <option value="11">11</option>
+              <option value="15">15</option>
+            </select>
+          </label>
+        </div>
+
+        <div class="examples">
+          <span class="examples-label">Try an example:</span>
+          <button class="chip" data-example="lysozyme" type="button">Lysozyme (78 aa)</button>
+          <button class="chip" data-example="helix" type="button">Helix-rich</button>
+          <button class="chip" data-example="sheet" type="button">Sheet-rich</button>
+          <button class="chip" data-example="mixed" type="button">Mixed (244 aa)</button>
+        </div>
+
+        <div class="actions">
+          <button id="run" class="btn primary" type="button">
+            <span class="btn-label">Analyze structure</span>
+            <span class="spinner" hidden></span>
+          </button>
+          <label class="check">
+            <input id="save" type="checkbox" />
+            <span>Save to my account</span>
+          </label>
+        </div>
+        <p id="input-error" class="error" hidden></p>
+      </div>
+
+      <div id="results" class="results" hidden>
+        <div class="stat-grid" id="stat-grid"></div>
+
+        <div class="panel">
+          <div class="panel-head">
+            <h2>Secondary structure</h2>
+            <span class="hint" id="ss-legend"></span>
+          </div>
+          <div id="ss-bar" class="ss-bar"></div>
+          <div id="ss-segments" class="segments"></div>
+        </div>
+
+        <div class="panel">
+          <div class="panel-head">
+            <h2>3D C-alpha trace</h2>
+            <span class="hint">Drag to rotate · scroll to zoom</span>
+          </div>
+          <canvas id="viewer" width="900" height="520"></canvas>
+          <div class="viewer-controls">
+            <label class="check"><input id="color-ss" type="checkbox" checked /><span>Colour by structure</span></label>
+            <label class="check"><input id="color-conf" type="checkbox" /><span>Colour by confidence</span></label>
+            <button id="reset-view" class="btn ghost small" type="button">Reset view</button>
+          </div>
+        </div>
+
+        <div class="two-col">
+          <div class="panel">
+            <div class="panel-head"><h2>Contact map</h2><span class="hint" id="contact-hint"></span></div>
+            <canvas id="contactmap" width="520" height="520"></canvas>
+          </div>
+          <div class="panel">
+            <div class="panel-head"><h2>Hydropathy profile</h2><span class="hint">Kyte-Doolittle, windowed</span></div>
+            <canvas id="hydropathy" width="520" height="240"></canvas>
+            <div class="panel-head" style="margin-top:1rem"><h2>Hydrophobic moment</h2><span class="hint">Ideal α-helix, 3.6 res/turn</span></div>
+            <canvas id="moment" width="520" height="240"></canvas>
+          </div>
+        </div>
+
+        <div class="panel">
+          <div class="panel-head">
+            <h2>Properties</h2>
+            <span class="hint">Every value from a published scale</span>
+          </div>
+          <div id="props" class="props"></div>
+        </div>
+
+        <div class="panel">
+          <div class="panel-head">
+            <h2>Per-residue table</h2>
+            <span class="hint" id="table-hint"></span>
+          </div>
+          <div class="table-wrap"><table id="residue-table"></table></div>
+        </div>
+
+        <div class="panel">
+          <div class="panel-head"><h2>Export</h2><span class="hint">Download the result</span></div>
+          <div class="actions">
+            <button class="btn ghost" data-export="pdb" type="button">PDB (C-alpha)</button>
+            <button class="btn ghost" data-export="csv" type="button">CSV</button>
+            <button class="btn ghost" data-export="txt" type="button">Text report</button>
+          </div>
+          <p class="hint" id="export-hint">Exports need the prediction saved to your account.</p>
+        </div>
+      </div>
+    </section>
+
+    <!-- ================= SAVED ================= -->
+    <section id="view-saved" class="view">
+      <div class="panel">
+        <div class="panel-head"><h2>Saved predictions</h2><span class="hint" id="saved-hint"></span></div>
+        <div id="saved-list" class="saved-list"></div>
+      </div>
+    </section>
+
+    <!-- ================= ABOUT ================= -->
+    <section id="view-about" class="view">
+      <div class="panel prose">
+        <h2>What this is</h2>
+        <p>
+          Proteoscope takes a protein sequence and returns three things: a secondary-structure
+          assignment, a contact map, and a 3D C-alpha trace. It is <strong>deterministic</strong> —
+          the same sequence always produces the same output — and <strong>explainable</strong> —
+          every number traces back to a published scale or a stated heuristic.
+        </p>
+
+        <h2>What this is not</h2>
+        <p>
+          It is not AlphaFold. There are no learned weights and no network calls. Secondary
+          structure uses Chou-Fasman propensities (1974), which agree with experiment on roughly
+          60–65% of residues — useful, but not a substitute for a real structure. The 3D trace is
+          a physically-constrained model, not a prediction of the true fold. Treat the output as a
+          teaching and triage aid.
+        </p>
+
+        <h2>How it works</h2>
+        <ol>
+          <li><strong>Parse &amp; validate</strong> — clean the input, reject non-standard residues.</li>
+          <li><strong>Properties</strong> — molecular weight, pI by bisection, GRAVY, aliphatic index, extinction coefficient.</li>
+          <li><strong>Secondary structure</strong> — Chou-Fasman nucleation and extension, helix &gt; sheet &gt; turn.</li>
+          <li><strong>Contacts</strong> — propensity scoring with a hard physical reachability constraint.</li>
+          <li><strong>3D trace</strong> — ideal geometry, then position-based dynamics to satisfy contacts and remove clashes.</li>
+          <li><strong>Confidence</strong> — a heuristic in [0,1] from secondary structure, contact satisfaction and clashes. Not pLDDT.</li>
+        </ol>
+
+        <h2>API</h2>
+        <p>Interactive docs live at <a href="/api/docs">/api/docs</a>. The main endpoint is
+          <code>POST /api/predictions</code>.</p>
+      </div>
+    </section>
+  </main>
+
+  <footer class="footer">
+    <p>
+      Proteoscope is a deterministic, explainable structure <em>analysis</em> tool. It is not
+      AlphaFold, it uses no learned weights, and its output is not an experimental structure.
+    </p>
+  </footer>
+
+  <!-- Auth modal -->
+  <div id="auth-modal" class="modal" hidden>
+    <div class="modal-card">
+      <button id="auth-close" class="modal-close" type="button" aria-label="Close">×</button>
+      <h2 id="auth-title">Sign in</h2>
+      <p class="hint" id="auth-sub">Save predictions and export them later.</p>
+      <label class="field"><span class="field-label">Email</span>
+        <input id="auth-email" type="email" autocomplete="email" /></label>
+      <label class="field" id="auth-name-field" hidden><span class="field-label">Name</span>
+        <input id="auth-name" type="text" autocomplete="name" /></label>
+      <label class="field"><span class="field-label">Password</span>
+        <input id="auth-password" type="password" autocomplete="current-password" /></label>
+      <p id="auth-error" class="error" hidden></p>
+      <div class="actions">
+        <button id="auth-submit" class="btn primary" type="button">Sign in</button>
+        <button id="auth-toggle" class="btn ghost" type="button">Create an account</button>
+      </div>
+    </div>
+  </div>
+
+  <script src="/assets/app.js"></script>
+</body>
+</html>
