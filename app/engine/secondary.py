@@ -1,119 +1,265 @@
 """Secondary-structure prediction by the Chou-Fasman method.
 
-Chou & Fasman (1974) assign each residue a propensity for alpha-helix (P_a),
-beta-sheet (P_b) and beta-turn (P_t). A stretch of residues with high P_a forms
-a helix; high P_b forms a sheet; otherwise the region is coil. This is a
-faithful, deterministic implementation of the classic rules.
+Chou & Fasman (1974, 1978) assign each residue a propensity to sit in a helix,
+a sheet, or a turn. The algorithm nucleates runs of high-propensity residues and
+extends them. It is old, it is not accurate by modern standards (roughly 60-65%
+per-residue agreement on real proteins), and it is *fully inspectable* — which is
+exactly why it is here. Every assignment can be traced back to a table value.
+
+The propensity tables below are the published ones. Where a residue has no
+published turn propensity it is given 1.00 (neutral) rather than a guess.
 """
 
 from __future__ import annotations
 
-# Chou-Fasman conformational parameters (P_a, P_b, P_t).
-_CF: dict[str, tuple[float, float, float]] = {
-    "A": (1.42, 0.83, 0.66), "R": (0.98, 0.93, 0.95), "N": (0.67, 0.89, 1.56),
-    "D": (1.01, 0.54, 1.46), "C": (0.70, 1.19, 1.19), "E": (1.51, 0.37, 0.74),
-    "Q": (1.11, 1.10, 0.98), "G": (0.57, 0.75, 1.56), "H": (1.00, 0.87, 0.95),
-    "I": (1.08, 1.60, 0.47), "L": (1.21, 1.30, 0.59), "K": (1.14, 0.74, 1.01),
-    "M": (1.45, 1.05, 0.60), "F": (1.13, 1.38, 0.60), "P": (0.57, 0.55, 1.52),
-    "S": (0.77, 0.75, 1.43), "T": (0.83, 1.19, 0.96), "W": (1.08, 1.37, 0.96),
-    "Y": (0.69, 1.47, 1.14), "V": (1.06, 1.70, 0.50),
+import math
+from dataclasses import dataclass
+
+from app.engine.sequence import KYTE_DOOLITTLE
+
+# P(a) helix, P(b) sheet, P(t) turn. Chou-Fasman, as tabulated in
+# Creighton, "Proteins" (2nd ed.), Table 6.2.
+HELIX_PROPENSITY: dict[str, float] = {
+    "A": 1.42,
+    "R": 0.98,
+    "N": 0.67,
+    "D": 1.01,
+    "C": 0.70,
+    "Q": 1.11,
+    "E": 1.51,
+    "G": 0.57,
+    "H": 1.00,
+    "I": 1.08,
+    "L": 1.21,
+    "K": 1.16,
+    "M": 1.45,
+    "F": 1.13,
+    "P": 0.57,
+    "S": 0.77,
+    "T": 0.83,
+    "W": 1.08,
+    "Y": 0.69,
+    "V": 1.06,
 }
 
-# Ambiguous residues default to coil-neutral values.
-_DEFAULT = (1.0, 1.0, 1.0)
+SHEET_PROPENSITY: dict[str, float] = {
+    "A": 0.83,
+    "R": 0.93,
+    "N": 0.89,
+    "D": 0.54,
+    "C": 1.19,
+    "Q": 1.10,
+    "E": 0.37,
+    "G": 0.75,
+    "H": 0.87,
+    "I": 1.60,
+    "L": 1.30,
+    "K": 0.74,
+    "M": 1.05,
+    "F": 1.38,
+    "P": 0.55,
+    "S": 0.75,
+    "T": 1.19,
+    "W": 1.37,
+    "Y": 1.47,
+    "V": 1.70,
+}
 
-# A helix/sheet nucleus is a run of 4+ residues where the average propensity
-# exceeds this threshold.
-_NUCLEUS = 1.03
-# A helix/sheet is extended while the average stays above this.
-_EXTEND = 1.00
+TURN_PROPENSITY: dict[str, float] = {
+    "A": 0.66,
+    "R": 0.95,
+    "N": 1.56,
+    "D": 1.46,
+    "C": 1.19,
+    "Q": 0.98,
+    "E": 0.74,
+    "G": 1.56,
+    "H": 0.95,
+    "I": 0.47,
+    "L": 0.59,
+    "K": 1.01,
+    "M": 0.60,
+    "F": 0.60,
+    "P": 1.52,
+    "S": 1.43,
+    "T": 0.96,
+    "W": 0.96,
+    "Y": 1.14,
+    "V": 0.50,
+}
+
+# Residues that break a helix outright.
+HELIX_BREAKERS: frozenset[str] = frozenset("PG")
+# Residues that break a sheet.
+SHEET_BREAKERS: frozenset[str] = frozenset("PDGKRS")
+
+HELIX_THRESHOLD = 1.03
+SHEET_THRESHOLD = 1.05
+TURN_THRESHOLD = 1.00
+
+HELIX_MIN_RUN = 4
+SHEET_MIN_RUN = 3
+TURN_WINDOW = 4
+
+# One-letter codes for the three states plus coil.
+HELIX = "H"
+SHEET = "E"
+TURN = "T"
+COIL = "C"
+
+_TWO_PI = 2.0 * math.pi
 
 
-def _pa(aa: str) -> float:
-    return _CF.get(aa, _DEFAULT)[0]
+@dataclass(frozen=True)
+class SecondaryStructure:
+    """Per-residue secondary-structure assignment."""
+
+    assignment: str
+    helix_fraction: float
+    sheet_fraction: float
+    turn_fraction: float
+    coil_fraction: float
+    segments: list[dict]
+
+    @property
+    def length(self) -> int:
+        return len(self.assignment)
 
 
-def _pb(aa: str) -> float:
-    return _CF.get(aa, _DEFAULT)[1]
+def _spans_from_flags(flags: list[bool]) -> list[tuple[int, int]]:
+    """Maximal [start, end) spans where `flags` is True."""
+    spans: list[tuple[int, int]] = []
+    start: int | None = None
+    for i, flag in enumerate(flags):
+        if flag:
+            if start is None:
+                start = i
+        elif start is not None:
+            spans.append((start, i))
+            start = None
+    if start is not None:
+        spans.append((start, len(flags)))
+    return spans
 
 
-def _pt(aa: str) -> float:
-    return _CF.get(aa, _DEFAULT)[2]
+def _segments(assignment: str) -> list[dict]:
+    """Collapse a per-residue string into contiguous labelled segments."""
+    if not assignment:
+        return []
+    labels = {HELIX: "helix", SHEET: "sheet", TURN: "turn", COIL: "coil"}
+    segments: list[dict] = []
+    start = 0
+    current = assignment[0]
+    for i in range(1, len(assignment)):
+        if assignment[i] != current:
+            segments.append(
+                {
+                    "type": labels[current],
+                    "start": start + 1,  # 1-based, inclusive
+                    "end": i,  # 1-based, inclusive
+                    "length": i - start,
+                }
+            )
+            start = i
+            current = assignment[i]
+    segments.append(
+        {
+            "type": labels[current],
+            "start": start + 1,
+            "end": len(assignment),
+            "length": len(assignment) - start,
+        }
+    )
+    return segments
 
 
-def predict_secondary(sequence: str) -> dict:
-    """Return per-residue assignments and overall fractions.
+def predict_secondary_structure(sequence: str) -> SecondaryStructure:
+    """Assign H / E / T / C to every residue.
 
-    The result dict has:
-      - ``assignments``: list of 'H' | 'E' | 'T' | 'C' per residue
-      - ``helix_fraction``, ``sheet_fraction``, ``turn_fraction``, ``coil_fraction``
+    Order of operations matters and follows Chou-Fasman:
+
+    1. Nucleate helices: a run of >= 4 residues with P(a) >= 1.03 and no
+       proline or glycine inside.
+    2. Nucleate sheets: a run of >= 3 residues with P(b) >= 1.05 and no
+       sheet-breaking residue inside.
+    3. Mark turns: any 4-residue window whose mean P(t) >= 1.00.
+    4. Resolve overlaps: helix beats sheet beats turn, because that is the
+       priority Chou-Fasman gives them.
+    5. Everything left over is coil.
     """
     n = len(sequence)
     if n == 0:
-        return {
-            "assignments": [],
-            "helix_fraction": 0.0,
-            "sheet_fraction": 0.0,
-            "turn_fraction": 0.0,
-            "coil_fraction": 1.0,
-        }
+        return SecondaryStructure("", 0.0, 0.0, 0.0, 0.0, [])
 
-    # Pass 1: find helix and sheet nuclei, then extend them.
-    state = ["C"] * n
+    helix_scores = [HELIX_PROPENSITY[c] for c in sequence]
+    sheet_scores = [SHEET_PROPENSITY[c] for c in sequence]
+    turn_scores = [TURN_PROPENSITY[c] for c in sequence]
 
-    # Helices.
-    i = 0
-    while i < n - 3:
-        window = sequence[i : i + 4]
-        if sum(_pa(a) for a in window) / 4.0 >= _NUCLEUS:
-            j = i + 4
-            while j < n and sum(_pa(a) for a in sequence[i : j + 1]) / (j - i + 1) >= _EXTEND:
-                j += 1
-            for k in range(i, j):
-                state[k] = "H"
-            i = j
-        else:
-            i += 1
+    state = [COIL] * n
 
-    # Sheets (only where not already helix).
-    i = 0
-    while i < n - 3:
-        if state[i] == "H":
-            i += 1
+    # --- 1. Helices ---------------------------------------------------------
+    helix_ok = [helix_scores[i] >= HELIX_THRESHOLD and sequence[i] not in HELIX_BREAKERS for i in range(n)]
+    for start, end in _spans_from_flags(helix_ok):
+        if end - start >= HELIX_MIN_RUN:
+            for i in range(start, end):
+                state[i] = HELIX
+
+    # --- 2. Sheets ----------------------------------------------------------
+    sheet_ok = [sheet_scores[i] >= SHEET_THRESHOLD and sequence[i] not in SHEET_BREAKERS for i in range(n)]
+    for start, end in _spans_from_flags(sheet_ok):
+        if end - start >= SHEET_MIN_RUN:
+            for i in range(start, end):
+                if state[i] == COIL:
+                    state[i] = SHEET
+
+    # --- 3. Turns -----------------------------------------------------------
+    for i in range(n):
+        if state[i] != COIL:
             continue
-        window = sequence[i : i + 4]
-        if sum(_pb(a) for a in window) / 4.0 >= _NUCLEUS:
-            j = i + 4
-            while j < n and state[j] != "H" and sum(_pb(a) for a in sequence[i : j + 1]) / (j - i + 1) >= _EXTEND:
-                j += 1
-            for k in range(i, j):
-                state[k] = "E"
-            i = j
-        else:
-            i += 1
+        if i + TURN_WINDOW > n:
+            break
+        window_mean = sum(turn_scores[i : i + TURN_WINDOW]) / TURN_WINDOW
+        if window_mean >= TURN_THRESHOLD:
+            for j in range(i, i + TURN_WINDOW):
+                if state[j] == COIL:
+                    state[j] = TURN
 
-    # Pass 2: turns in the remaining coil regions.
-    for i in range(n - 3):
-        if state[i] != "C":
-            continue
-        window = sequence[i : i + 4]
-        # A turn is favoured when P_t is high and P_a/P_b are low.
-        pt_avg = sum(_pt(a) for a in window) / 4.0
-        pa_avg = sum(_pa(a) for a in window) / 4.0
-        pb_avg = sum(_pb(a) for a in window) / 4.0
-        if pt_avg > 1.0 and pt_avg > pa_avg and pt_avg > pb_avg:
-            for k in range(i, i + 4):
-                if state[k] == "C":
-                    state[k] = "T"
+    assignment = "".join(state)
+    counts = {s: assignment.count(s) for s in (HELIX, SHEET, TURN, COIL)}
+    segments = _segments(assignment)
 
-    counts = {"H": 0, "E": 0, "T": 0, "C": 0}
-    for s in state:
-        counts[s] += 1
+    return SecondaryStructure(
+        assignment=assignment,
+        helix_fraction=round(counts[HELIX] / n, 4),
+        sheet_fraction=round(counts[SHEET] / n, 4),
+        turn_fraction=round(counts[TURN] / n, 4),
+        coil_fraction=round(counts[COIL] / n, 4),
+        segments=segments,
+    )
 
-    return {
-        "assignments": state,
-        "helix_fraction": round(counts["H"] / n, 4),
-        "sheet_fraction": round(counts["E"] / n, 4),
-        "turn_fraction": round(counts["T"] / n, 4),
-        "coil_fraction": round(counts["C"] / n, 4),
-    }
+
+def hydrophobic_moment(sequence: str, window: int = 18) -> list[float]:
+    """Hydrophobic moment per residue, assuming an ideal alpha helix.
+
+    A real alpha helix has 3.6 residues per turn, so residues i and i+3/i+4 face
+    the same side. A high value means one face is greasy and the other is not —
+    the signature of a membrane-spanning or surface-binding helix.
+    """
+    n = len(sequence)
+    if n == 0:
+        return []
+    period = 3.6
+    half = window // 2
+    moments: list[float] = []
+    for i in range(n):
+        lo = max(0, i - half)
+        hi = min(n, i + half + 1)
+        real = 0.0
+        imag = 0.0
+        for j in range(lo, hi):
+            angle = _TWO_PI * (j - i) / period
+            h = KYTE_DOOLITTLE[sequence[j]]
+            real += h * math.cos(angle)
+            imag += h * math.sin(angle)
+        moments.append(round(math.hypot(real, imag) / (hi - lo), 3))
+    return moments
