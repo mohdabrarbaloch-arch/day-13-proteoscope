@@ -82,7 +82,7 @@ def list_predictions(
     rows = db.scalars(
         select(Prediction)
         .where(Prediction.owner_id == user.id)
-        .order_by(Prediction.created_at.desc())
+        .order_by(Prediction.created_at.desc(), Prediction.id.desc())
         .limit(limit)
         .offset(offset)
     ).all()
@@ -90,53 +90,69 @@ def list_predictions(
 
 
 @router.get("/{prediction_id}", response_model=PredictionDetail)
-def get_prediction(prediction_id: int, db: Session = Depends(get_db), user: User = Depends(get_current_user)) -> PredictionDetail:
+def get_prediction(
+    prediction_id: int,
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+) -> PredictionDetail:
     """Fetch one saved prediction, including the full result."""
     record = db.get(Prediction, prediction_id)
+    # 404 rather than 403 for someone else's record: a 403 would confirm the id
+    # exists, which leaks information about other users' data.
     if record is None or record.owner_id != user.id:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Prediction not found")
-    return PredictionDetail.model_validate(record)
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Prediction not found.")
+
+    return PredictionDetail(
+        id=record.id,
+        label=record.label,
+        length=record.length,
+        mean_confidence=record.mean_confidence,
+        helix_fraction=record.helix_fraction,
+        sheet_fraction=record.sheet_fraction,
+        contact_count=record.contact_count,
+        created_at=record.created_at,
+        sequence=record.sequence,
+        result=json.loads(record.result_json),
+    )
 
 
-@router.get("/{prediction_id}/export")
+@router.delete("/{prediction_id}", status_code=status.HTTP_204_NO_CONTENT, response_class=Response)
+def delete_prediction(
+    prediction_id: int,
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+) -> Response:
+    """Delete a saved prediction."""
+    record = db.get(Prediction, prediction_id)
+    if record is None or record.owner_id != user.id:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Prediction not found.")
+    db.delete(record)
+    db.commit()
+    return Response(status_code=status.HTTP_204_NO_CONTENT)
+
+
+@router.get("/{prediction_id}/export", response_class=PlainTextResponse)
 def export_prediction(
     prediction_id: int,
     fmt: str = Query(default="pdb", pattern="^(pdb|csv|txt)$"),
     db: Session = Depends(get_db),
     user: User = Depends(get_current_user),
-) -> Response:
-    """Export a saved prediction as PDB, CSV, or plain text."""
+) -> PlainTextResponse:
+    """Export a saved prediction as PDB, CSV, or a text report."""
     record = db.get(Prediction, prediction_id)
     if record is None or record.owner_id != user.id:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Prediction not found")
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Prediction not found.")
 
     result = json.loads(record.result_json)
     if fmt == "pdb":
-        body = to_pdb(result)
-        media = "chemical/x-pdb"
-        filename = f"proteoscope-{record.id}.pdb"
+        body, media, filename = to_pdb(result), "chemical/x-pdb", f"proteoscope-{record.id}.pdb"
     elif fmt == "csv":
-        body = to_csv(result)
-        media = "text/csv"
-        filename = f"proteoscope-{record.id}.csv"
+        body, media, filename = to_csv(result), "text/csv", f"proteoscope-{record.id}.csv"
     else:
-        body = build_report(result)
-        media = "text/plain"
-        filename = f"proteoscope-{record.id}.txt"
+        body, media, filename = build_report(result), "text/plain", f"proteoscope-{record.id}.txt"
 
     return PlainTextResponse(
-        body,
+        content=body,
         media_type=media,
         headers={"Content-Disposition": f'attachment; filename="{filename}"'},
     )
-
-
-@router.delete("/{prediction_id}", status_code=status.HTTP_204_NO_CONTENT, response_class=Response)
-def delete_prediction(prediction_id: int, db: Session = Depends(get_db), user: User = Depends(get_current_user)) -> Response:
-    """Delete one of the caller's predictions."""
-    record = db.get(Prediction, prediction_id)
-    if record is None or record.owner_id != user.id:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Prediction not found")
-    db.delete(record)
-    db.commit()
-    return Response(status_code=status.HTTP_204_NO_CONTENT)
